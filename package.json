@@ -1,0 +1,43 @@
+{
+  "name": "selfhog",
+  "version": "1.0.0",
+  "description": "Claude Code skills for self-hosting PostHog with Docker Compose — battle-tested /deploy-posthog and /posthog-health slash commands",
+  "keywords": [
+    "claude-code",
+    "claude-skill",
+    "posthog",
+    "self-host",
+    "docker-compose",
+    "selfhog",
+    "posthog-deploy",
+    "devops"
+  ],
+  "homepage": "https://github.com/Ismail-Mirza/selfhog",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Ismail-Mirza/selfhog.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Ismail-Mirza/selfhog/issues"
+  },
+  "author": {
+    "name": "Mohammad Ismail",
+    "email": "ismail.me.buet@gmail.com",
+    "url": "https://www.linkedin.com/in/ismail-mirza/"
+  },
+  "license": "MIT",
+  "bin": {
+    "selfhog": "./bin/install.js"
+  },
+  "files": [
+    "bin/",
+    "skills/",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "postinstall": "node bin/install.js"
+  }
+}
