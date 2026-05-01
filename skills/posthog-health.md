@@ -17,6 +17,23 @@ curl -s https://<DOMAIN>/_preflight/ | python3 -m json.tool | \
 
 Expected: all `true`. For each `false`, apply the matching fix below.
 
+## Step 2 — Event ingestion is reachable (capture-rs)
+
+`/_preflight/` does NOT cover the event ingestion path. Test it explicitly:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -X POST 'https://<DOMAIN>/batch/' \
+  -H 'Content-Type: application/json' \
+  --data '{"api_key":"<phc_...>","batch":[{"event":"t","distinct_id":"d","properties":{}}]}'
+```
+
+| Result | Meaning | Action |
+|---|---|---|
+| `200` | capture-rs healthy, events flowing to Kafka | ✅ done |
+| `403` (HTML body, "CSRF verification failed") | Request hit Django, not capture-rs | See *Fix: events return 403 CSRF* below |
+| `502` | capture-rs container down | `docker compose --env-file .env up -d posthog_capture` |
+| `401` / `400` | api_key invalid / payload malformed | Check the project key, not infra |
+
 ---
 
 ## Fix: `"plugins": false`
@@ -156,6 +173,39 @@ ZooKeeper must be healthy before Kafka starts.
 
 ---
 
+## Fix: events return `403 CSRF verification failed`
+
+This means ingestion POSTs are reaching **Django**, not capture-rs. Three things to check:
+
+**Check 1 — Is `posthog_capture` running?**
+```bash
+docker ps --filter name=posthog_capture --format "{{.Status}}"
+docker logs posthog_capture --tail 20
+```
+You should see `listening on 0.0.0.0:3000` and `connected to Kafka brokers`.
+
+**If missing:** the service isn't in `docker-compose.yml`. Add the `posthog_capture` block (see `/deploy-posthog` Step 4) and:
+```bash
+docker compose --env-file .env up -d posthog_capture
+```
+
+**Check 2 — Does nginx route `/batch/` to capture-rs?**
+```bash
+docker exec periscale_nginx grep -A2 'capture\|posthog_capture' /etc/nginx/conf.d/posthog.conf
+```
+Should show `proxy_pass http://posthog_capture:3000;` for the `/(e|batch|capture|track|engage)/` and `/i/` locations. **If it still says `posthog_web:8000`** for ingestion paths, replace the locations (see `/deploy-posthog` Step 4b) and:
+```bash
+docker exec periscale_nginx nginx -t && docker exec periscale_nginx nginx -s reload
+```
+
+**Check 3 — Image pull failed?**
+```bash
+docker images | grep capture
+```
+The image must be `ghcr.io/posthog/posthog/capture:master` (note the doubled `posthog/posthog`). If a previous compose used `ghcr.io/posthog/capture:latest`, the pull failed silently and the container is missing.
+
+---
+
 ## Fix: Nginx 502/504 after container recreation
 
 **502** — Nginx has cached old container IP:
@@ -176,8 +226,11 @@ Wait for all 4 `"posthog" application started` messages (~12 min total on first 
 Run this to get a complete picture:
 ```bash
 HOST=<DOMAIN>
+KEY=<phc_project_key>
 echo "=== Preflight ===" && curl -s https://$HOST/_preflight/ | python3 -m json.tool | grep -E 'django|redis|plugins|celery|clickhouse|kafka|"db"'
 echo "=== Containers ===" && docker ps --format "{{.Names}}\t{{.Status}}" | sort
 echo "=== Plugin server ===" && docker exec posthog_plugins curl -s http://localhost:6738/_health | python3 -m json.tool 2>/dev/null | head -5
+echo "=== capture-rs ===" && docker logs --tail 3 posthog_capture 2>&1 | tail -3
+echo "=== Ingestion test (should be 200) ===" && curl -s -o /dev/null -w "%{http_code}\n" -X POST "https://$HOST/batch/" -H 'Content-Type: application/json' --data "{\"api_key\":\"$KEY\",\"batch\":[{\"event\":\"_health\",\"distinct_id\":\"d\",\"properties\":{}}]}"
 echo "=== Heartbeat age ===" && PASS=$(grep REDIS_PASSWORD /opt/posthog/.env | cut -d= -f2) && HB=$(docker exec periscale_redis redis-cli -p 6379 -a $PASS --no-auth-warning GET POSTHOG_HEARTBEAT) && echo "$(($(date +%s) - ${HB:-0})) seconds ago"
 ```

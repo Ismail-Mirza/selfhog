@@ -12,9 +12,15 @@ Ask for these if not already provided:
 ## Architecture
 
 ```
-nginx (443/80) → posthog_web:8000 (Django + Nginx Unit)
-                  posthog_worker (Celery + beat scheduler)
-                  posthog_plugins (posthog/posthog-node — CDP/plugin server)
+nginx (443/80)
+  ├── /e/ /batch/ /capture/ /track/ /engage/ /i/*  → posthog_capture:3000  (capture-rs, Rust)
+  ├── /decide/                                     → posthog_web:8000     (Django feature flags)
+  └── /                                            → posthog_web:8000     (Django UI + queries)
+
+                  posthog_capture  (ghcr.io/posthog/posthog/capture — Rust event ingestion)
+                  posthog_web      (Django + Nginx Unit)
+                  posthog_worker   (Celery + beat scheduler)
+                  posthog_plugins  (posthog/posthog-node — CDP/plugin server, consumes Kafka)
                   posthog_clickhouse
                   posthog_kafka ← posthog_zookeeper
                   redis (authenticated, TLS on 6380)
@@ -23,7 +29,9 @@ nginx (443/80) → posthog_web:8000 (Django + Nginx Unit)
                   pgbouncer:6584
 ```
 
-**Key split:** `posthog/posthog` image handles web + worker. `posthog/posthog-node` image handles the plugin/CDP server. They must NOT share the same image.
+**Key splits:**
+- `posthog/posthog` image handles web + worker. `posthog/posthog-node` image handles the plugin/CDP server. They must NOT share the same image.
+- **Modern PostHog (≥ commit `edb2bdd4`, ~2024-09) removed `/e/`, `/batch/`, `/capture/`, `/i/v0/e/` from Django URLs entirely.** Without `posthog_capture` (the Rust `ghcr.io/posthog/posthog/capture` image), every event POST falls through to Django's 404 handler and is rejected with `403 CSRF verification failed`. **You must include `posthog_capture` and route ingestion paths to it via nginx.**
 
 ## Step 1 — SSH and prepare VPS
 
@@ -225,11 +233,39 @@ services:
       IS_BEHIND_PROXY: "true"
       TRUST_ALL_PROXIES: "true"
       DISABLE_SECURE_SSL_REDIRECT: "true"
+      # Django 4.x rejects POSTs to non-trusted origins with 403 CSRF, even
+      # when SITE_URL is set. Without these explicit overrides, /decide/ and
+      # any other Django POST endpoint will fail.
+      CSRF_TRUSTED_ORIGINS: https://${DOMAIN_POSTHOG}
+      ALLOWED_HOSTS: ${DOMAIN_POSTHOG},localhost,127.0.0.1
       NGINX_UNIT_PRELOAD_CONFIG: "true"
       POSTHOG_SKIP_MIGRATION_CHECKS: "1"
       # Critical: tells Django where the plugin server lives
       CDP_API_URL: http://posthog_plugins:6738
     expose: ["8000"]
+    networks: [db_net, posthog_net]
+
+  # capture-rs (Rust) — handles ALL event ingestion. Modern PostHog removed
+  # /e/ /batch/ /capture/ /i/v0/e/ from Django URLs. Image + env mirror the
+  # canonical PostHog docker-compose.base.yml `capture` service.
+  posthog_capture:
+    image: ghcr.io/posthog/posthog/capture:master
+    container_name: posthog_capture
+    restart: unless-stopped
+    depends_on:
+      posthog_kafka: {condition: service_started}
+      redis: {condition: service_healthy}
+    environment:
+      ADDRESS: 0.0.0.0:3000
+      KAFKA_HOSTS: posthog_kafka:9092
+      KAFKA_TOPIC: events_plugin_ingestion
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/
+      CAPTURE_MODE: events
+      RUST_LOG: info,rdkafka=warn
+    expose: ["3000"]
+    deploy:
+      resources:
+        limits: {cpus: '1', memory: 256M}
     networks: [db_net, posthog_net]
 
   posthog_worker:
@@ -323,6 +359,63 @@ networks:
 
 Replace `<TAG>` with the pinned image digest, e.g. `edb2bdd4a92b7b6104aa233c814bfd1b670b3811`.
 
+## Step 4b — nginx routing for capture-rs
+
+Place this in `nginx/conf.d/posthog.conf` inside the HTTPS server block. **Order matters** — the more specific ingestion locations must come before the catch-all `/`.
+
+```nginx
+# Ingestion endpoints — capture-rs (Rust). Generous timeouts, no buffering.
+location ~ ^/(e|batch|capture|track|engage)/ {
+    proxy_pass         http://posthog_capture:3000;
+    proxy_http_version 1.1;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_read_timeout 60s;
+    proxy_send_timeout 60s;
+    proxy_buffering    off;
+}
+
+location /i/ {
+    proxy_pass         http://posthog_capture:3000;
+    proxy_http_version 1.1;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_read_timeout 60s;
+    proxy_send_timeout 60s;
+    proxy_buffering    off;
+}
+
+# /decide/ stays on Django — capture-rs doesn't serve feature-flag eval.
+location /decide/ {
+    proxy_pass         http://posthog_web:8000;
+    proxy_http_version 1.1;
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_read_timeout 30s;
+    proxy_buffering    off;
+}
+
+# Everything else — UI, /api/, /admin/ — goes to Django.
+location / {
+    proxy_pass         http://posthog_web:8000;
+    proxy_http_version 1.1;
+    proxy_set_header   Upgrade           $http_upgrade;
+    proxy_set_header   Connection        "upgrade";
+    proxy_set_header   Host              $host;
+    proxy_set_header   X-Real-IP         $remote_addr;
+    proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+    proxy_buffering    off;
+    proxy_read_timeout 30s;
+}
+```
+
 ## Step 5 — Deploy
 
 ```bash
@@ -396,6 +489,25 @@ docker exec periscale_redis redis-cli -a $REDIS_PASSWORD GET POSTHOG_HEARTBEAT
 ### 8. posthog_web nodejs crash loop
 **Cause:** `bin/docker` (default CMD) runs `bin/docker-worker` which starts `bin/posthog-node` — but `posthog/posthog` image does not contain the Node.js plugin server code.
 **Fix:** Override command to `bash -c "./bin/migrate && ./bin/docker-server"` (skips the nodejs loop; celery is handled by posthog_worker).
+
+### 9. **All event POSTs return `403 CSRF verification failed`** (capture-rs missing)
+**Symptom:** `POST /batch/`, `/e/`, `/capture/` — all return 403 with HTML page "Referer checking failed - no Referer." Django logs show `[django.security.csrf]`. POST to a non-existent route also returns 403.
+**Cause:** Modern `posthog/posthog` images (commit `edb2bdd4` and later, ~Sep 2024) **removed** these URLs from Django and moved ingestion to a separate Rust service (`ghcr.io/posthog/posthog/capture`). When the Rust service isn't deployed and nginx still routes `/batch/` to `posthog_web`, Django can't resolve the URL; the request falls through to the default 404 view, which is wrapped by CSRF middleware → 403.
+**Fix:** Deploy the `posthog_capture` service (Step 4 template above) and add the routing block from Step 4b. After redeploy:
+```bash
+docker compose --env-file .env up -d posthog_capture
+docker compose --env-file .env exec nginx nginx -t && \
+  docker compose --env-file .env exec nginx nginx -s reload
+# Verify:
+curl -s -o /dev/null -w "%{http_code}\n" -X POST 'https://<DOMAIN>/batch/' \
+  -H 'Content-Type: application/json' \
+  --data '{"api_key":"<phc_...>","batch":[{"event":"t","distinct_id":"d","properties":{}}]}'
+# Expect: 200
+```
+
+### 10. capture-rs image not found (`ghcr.io/posthog/capture: not found`)
+**Cause:** The image path is **doubled** — it lives at `ghcr.io/posthog/posthog/capture`, not `ghcr.io/posthog/capture`. There is no public Docker Hub mirror.
+**Fix:** Use the tag `master` (the only public tag): `image: ghcr.io/posthog/posthog/capture:master`.
 
 ## Startup time expectations
 

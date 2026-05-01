@@ -21,8 +21,8 @@ That's it. Two commands are now available in Claude Code:
 
 | Command | What it does |
 |---|---|
-| `/deploy-posthog` | Full guided deployment on a fresh VPS — generates secrets, writes compose file, handles TLS, explains every gotcha |
-| `/posthog-health` | Diagnoses and fixes a running stack — checks all 7 preflight services and gives exact fix commands |
+| `/deploy-posthog` | Full guided deployment on a fresh VPS — generates secrets, writes compose file (incl. capture-rs), handles TLS, explains every gotcha |
+| `/posthog-health` | Diagnoses and fixes a running stack — checks all 7 preflight services + event ingestion (capture-rs) and gives exact fix commands |
 
 ---
 
@@ -131,15 +131,20 @@ graph TB
         nginx["nginx:1.27\nnginx:443 / 80"]
     end
 
-    nginx -->|HTTP 8000| posthog_web
+    nginx -->|"/e/, /batch/, /capture/<br/>/track/, /engage/, /i/*<br/>HTTP 3000"| posthog_capture
+    nginx -->|"/decide/, /, /api/, /admin/<br/>HTTP 8000"| posthog_web
+
+    subgraph capture["Ingestion — ghcr.io/posthog/posthog/capture image (Rust)"]
+        posthog_capture["posthog_capture\nRust event ingestion\nport 3000\nvalidates api_key via Redis<br/>writes to Kafka events_plugin_ingestion"]
+    end
 
     subgraph app["Application — posthog/posthog image"]
-        posthog_web["posthog_web\nDjango + Nginx Unit\n4 workers\n./bin/migrate && ./bin/docker-server"]
+        posthog_web["posthog_web\nDjango + Nginx Unit\n4 workers\n./bin/migrate && ./bin/docker-server\n(UI + queries + /decide/)"]
         posthog_worker["posthog_worker\nCelery + redbeat\ndocker-worker-celery --with-scheduler"]
     end
 
     subgraph plugins["Plugin Server — posthog/posthog-node image"]
-        posthog_plugins["posthog_plugins\nCDP / Plugin Server\nport 6738\nnode dist/index.js"]
+        posthog_plugins["posthog_plugins\nCDP / Plugin Server\nport 6738\nnode dist/index.js\n(Kafka consumer → ClickHouse)"]
     end
 
     posthog_web -->|CDP_API_URL /_health| posthog_plugins
@@ -152,6 +157,7 @@ graph TB
     end
 
     zookeeper --> kafka
+    posthog_capture --> kafka
     posthog_web --> clickhouse
     posthog_web --> kafka
     posthog_worker --> clickhouse
@@ -165,6 +171,7 @@ graph TB
         pgbouncer["pgbouncer\nport 6584\nexternal connections"]
     end
 
+    posthog_capture -->|REDIS_URL\nteam-token cache| redis
     posthog_web --> redis
     posthog_worker --> redis
     posthog_plugins -->|CDP_REDIS| redis
@@ -226,6 +233,34 @@ When a container is recreated it gets a new IP. Nginx resolves hostnames at star
 
 ### 🔌 logs-ingestion hardcoded Redis host
 The plugin server's logs-ingestion and traces-ingestion consumers hardcode `127.0.0.1:6379` as their Redis host. Override with a dedicated unauthenticated Redis (`redis_cdp`) via env vars.
+
+### 🦀 capture-rs is mandatory — Django no longer routes `/batch/`
+Modern PostHog (commit `edb2bdd4` and later, ~Sep 2024) **removed** `/e/`, `/batch/`, `/capture/`, `/i/v0/e/` from Django's URL config and moved them to a separate Rust service. Without it, every event POST falls through to Django's CSRF-guarded 404 view → `403 CSRF verification failed`. Even POSTs to non-existent paths return 403, which is the diagnostic fingerprint.
+
+```yaml
+posthog_capture:
+  image: ghcr.io/posthog/posthog/capture:master  # ← note doubled "posthog/posthog"
+  environment:
+    KAFKA_TOPIC: events_plugin_ingestion          # plugin server consumes this
+    CAPTURE_MODE: events
+```
+
+The image is **only** at `ghcr.io/posthog/posthog/capture` — no Docker Hub mirror, no `:latest` tag (use `:master`).
+
+### 🛣️ nginx must route ingestion paths to capture-rs
+Add a location block before the catch-all `/`:
+```nginx
+location ~ ^/(e|batch|capture|track|engage)/ { proxy_pass http://posthog_capture:3000; }
+location /i/                                  { proxy_pass http://posthog_capture:3000; }
+location /decide/                             { proxy_pass http://posthog_web:8000; }   # stays on Django
+```
+
+### 🔒 Django 4.x CSRF needs `CSRF_TRUSTED_ORIGINS`
+Even after capture-rs handles ingestion, Django's `/decide/` and admin POSTs still require explicit trusted origins. Setting `SITE_URL` alone is not enough on Django 4.x:
+```yaml
+CSRF_TRUSTED_ORIGINS: https://${DOMAIN_POSTHOG}
+ALLOWED_HOSTS: ${DOMAIN_POSTHOG},localhost,127.0.0.1
+```
 
 ---
 
